@@ -1,0 +1,428 @@
+#!/usr/bin/env python
+#
+# Version 0.2
+#
+# The script uses pexpect to automate ssh login process.
+# It securely stores your password in a keychain. Where
+# OSX Keychain, Gnome Keyring and KDE Kwallet are supported.
+# You can configure different usernames and passwords for
+# hosts using glob patterns in jmp.conf file.
+#
+# Feel free to hack it, fork it or submit patches. 
+
+# Some non-standard modules the script depends on: 
+# - kerying >= 0.9.2
+# - pexpect  
+# - argparse when < python 2.7
+
+# Changelog
+# Version 0.3 
+#  - new --notmout cmd line and notmout config option for [__main__] 
+#    the option bypasses $TMOUT bash read-only variable
+#    Many thanks to Grzegorz Durys for the idea.
+# Version 0.2 
+#  - initial release
+# Version 0.1
+#  - proof of concept
+
+import keyring
+import getpass
+import os
+import sys
+import fnmatch
+import re
+import logging
+import argparse
+import termios
+import signal
+import pexpect
+import struct
+import fcntl
+import socket
+import string
+import ConfigParser
+
+global global_pexpect_instance
+
+class JMPKeyring(object):
+    """ For now this is only a wrapper class around keyring """
+
+    @staticmethod
+    def get_password(service, username):
+        """ Get password from the keychain for a given username """
+        return keyring.get_password(service, username)
+
+    @staticmethod
+    def set_password(service, username, password):
+        """ Set password in the keychain for a given username """
+        return keyring.set_password(service, username, password)
+
+    @staticmethod
+    def prompt_for_pass():
+        """ Prompt user for password """
+        return getpass.getpass("Password: ")
+
+class JMPConfig(object):
+    """ Parse the default config file for jmp """
+    default_conf = '%s/.jmp/jmp.conf' % os.environ.get('HOME')
+    def __init__(self, conf=default_conf):
+        """ Initialize with a path to the config file """
+        self.conf_file = conf
+        if not os.path.isfile(conf):
+            raise OSError(2, 'No such file or directory', conf)
+        self.config = ConfigParser.ConfigParser()
+        self.config.read(self.conf_file)
+        self.glob = True
+
+    def get_main(self, section, key):
+        return self.config.get(section, key)
+
+    def get_key_name(self, username, hostname):
+        for pair in  self.__get_items(username):
+            host_pattern, key = pair
+            if self.glob:
+                if self.__match_glob(host_pattern, hostname): return key
+            else:
+                if self.__match_regex(host_pattern, hostname): return key
+        return None
+
+    def __match_glob(self, pattern, entry):
+        return fnmatch.fnmatch(entry, pattern)
+
+    def __match_regex(self, pattern, entry):
+        reobj = re.compile(pattern)
+        return reobj.match(entry)
+
+    def __get_items(self, username):
+        return self.config.items(username)
+
+class JMPLog(object):
+    """ Manage logging on printing output """
+
+    def __init__(self):
+        """ Setup the required syslog logging and if options.debug set
+        redirect the outup to console using DEBUG log level """
+        # Use logging module and set the script name
+        self.logger = logging.getLogger(os.path.basename(sys.argv[0]))
+        # create console handler and set level to debug
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG)
+        # create formatter
+        formatter = logging.Formatter('%(levelname)s - %(name)s - %(message)s')
+        # add formatter to ch
+        ch.setFormatter(formatter)
+        # add ch to logger
+        self.logger.addHandler(ch)
+        self.logger.debug("Logging initialized")
+
+    def get_logger(self):
+        """ Return the logger object """
+        return self.logger
+
+class JMPOptions(object):
+    """ Parse command line options """
+
+    #Defaults
+    prompt_for_pass = False
+    response_timeout = 60
+
+
+    def __init__(self, desc='SSH login automation'):
+        self.parser = argparse.ArgumentParser(description=desc)
+        self.__set_args()
+        self.__update_user()
+
+    def get_opt(self):
+        return self.opt
+
+    def __set_args(self):
+        self.parser.add_argument('hostname',
+        help='Log in to the specified host (with optional username e.g.'
+        ' username@hostname)')
+        self.parser.add_argument('-l',  '--username',
+        help='Specity USERNAME to log in as on the remote machine '
+        '(default: %s)' % JMPOptions.likewise_user_fix(getpass.getuser()),
+        default=JMPOptions.likewise_user_fix(getpass.getuser()))
+        self.parser.add_argument('-C',  '--config',
+        help='USE custom CONFIG file (default: ~/.jmp/jmp.conf)',
+        default=JMPConfig.default_conf)
+        self.parser.add_argument('-T', '--timeout',
+        help='Response timeout in seconds. (default: %ss)' % self.response_timeout,
+        default=self.response_timeout, type=int)
+        self.parser.add_argument('-P', '--pass',
+        help='Always prompt for password. '
+        '(default: False)', dest='passwd', default=False, action='store_true')
+        self.parser.add_argument('-N', '--notmout',
+        help='Unset bash $TMOUT read-only variable. '
+        '(default: False)', dest='notmout', default=False, action='store_true')
+        self.parser.add_argument('-n', '--nosudo',
+        help='Don\'t sudo to root. '
+        '(default: False)', dest='nosudo', default=False, action='store_true')
+        self.parser.add_argument('--pdebug',
+        help='Enable pexpect debugging.'
+        '(default: False)', default=False, action='store_true')
+        self.opt = self.parser.parse_args()
+
+    def __update_user(self):
+        if '@' in self.opt.hostname:
+            self.opt.username, self.opt.hostname = self.opt.hostname.split('@', 1)
+
+    @staticmethod
+    def likewise_user_fix(username):
+        if username.find("\\") != -1:
+            return username.split("\\")[1]
+        return username
+
+
+class JMPCore(object):
+    """ The core jmp class """
+
+    def __init__(self):
+        user = None
+        try:
+            self.log = JMPLog().get_logger()
+        except Exception, err:
+            print 'FATAL: unable to initialize logging.'
+            sys.exit(1)
+
+        try:
+            self.opt = JMPOptions().get_opt()
+        except Exception, err:
+            self.log.error('%s. Fatal error while parsing command line '
+            'options.' % err)
+            sys.exit(2)
+        try:
+            self.conf=JMPConfig(self.opt.config)
+        except OSError, err:
+            self.log.error('%s. Please make sure the config file'
+            ' exists!' % err)
+            sys.exit(3)
+        except Exception, err:
+            self.log.error('%s. Error while parsing the config file.' % err)
+            sys.exit(4)
+
+        try:
+            user = self.conf.get_main('__main__','username')
+            option = self.conf.get_main('__main__','notmout').lower()
+            if option == 'true':
+                self.opt.notmout = True
+            if option == 'false':
+                self.opt.notmout = False
+        except Exception,err:
+            pass
+
+        if user and  self.opt.username == JMPOptions.likewise_user_fix(
+               getpass.getuser()):
+            self.opt.username = user
+            
+        host = JMPresolv().getfqdn(self.opt.hostname)
+
+        if host:
+            self.opt.hostname = host
+
+    def get_pass(self):
+        key = None
+        password = None
+        try:
+            key = self.conf.get_key_name(self.opt.username, self.opt.hostname)
+        except ConfigParser.NoSectionError, err:
+            self.log.error('%s. Please make sure that section [%s] exists in '
+            ' your config file.' % (err, self.opt.username))
+            sys.exit(5)
+        if key == None:
+            self.log.error('Unable find a match for %s '
+            'in the config file under [%s] section. Please create an entry or '
+            'make sure your host patterns include this '
+            'host.' % (self.opt.hostname, self.opt.username))
+            sys.exit(6)
+        try:
+            password = JMPKeyring.get_password(key, self.opt.username)
+        except Exception, err:
+            self.log.error('%s. Unable to retrieve password from the '
+            'keychain' % err)
+        if self.opt.passwd == True or password == None:
+            try:
+                password = JMPKeyring.prompt_for_pass()
+            except Exception, err:
+                self.log.error('%s. Unable to get a password from the'
+                ' user.' % err)
+                sys.exit(7)
+        try:
+            JMPKeyring.set_password(key, self.opt.username, password)
+        except Exception, err:
+            self.log.warn('%s. Unable to save the password in your'
+            ' keychain.' % err)
+        return password
+
+    def get_terminal(self):
+        try:
+            terminal = os.environ['TERM']
+        except Exception, err:
+            terminal = 'xterm-color'
+        return terminal
+
+    def sshlogin(self, password):
+        ssh_bin = 'ssh'
+        ssh_env = ''
+        sudo_cmd = r'sudo -K; sudo -i'
+
+        if self.opt.notmout == True:
+            ssh_env = r'-t "exec env -i /bin/bash -norc"'
+            sudo_cmd = r'sudo -K; exec env -i sudo /bin/bash -norc'
+
+        ssh_cmd = '%s %s@%s %s' % (ssh_bin, 
+                                   self.opt.username, 
+                                   self.opt.hostname,
+                                   ssh_env)
+        child = None
+        sys.stdout.write("\x1b]2;%s\x07" % self.opt.hostname.replace(".service-now.com",""))
+        self.log.debug('JMPCore.sshlogin(): ssh_cmd = %s', ssh_cmd)
+
+        try:
+            child = pexpect.spawn(ssh_cmd, timeout=self.opt.timeout)
+        except Exception, err:
+            self.log.error('%s. Unable to spawn ssh process' % err)
+        global global_pexpect_instace
+        if self.opt.pdebug:
+            child.logfile = sys.stdout
+        self.pexpect_instance = child
+        signal.signal(signal.SIGWINCH, self.__sigwinch_passthrough)
+
+        exp_prompt = r"[#$]"
+        exp_are_you_sure = r"(?i)are you sure you want to continue connecting"
+        exp_passphrase = r"(?i)(?:password)|(?:passphrase for key)"
+        exp_denied = r"(?i)permission denied"
+        exp_termtype = r"(?i)terminal type"
+        exp_closed = "(?i)connection closed by remote host"
+
+        exp_init = [exp_are_you_sure, exp_prompt, exp_passphrase, exp_denied,
+                exp_termtype, pexpect.TIMEOUT, exp_closed]
+        exp_type = [exp_are_you_sure, exp_prompt, exp_passphrase, exp_denied,
+                exp_termtype, pexpect.TIMEOUT]
+        #Phase 1
+        i = None
+        try:
+            i = child.expect(exp_init)
+        except Exception, err:
+            self.log.error('%s. Connection failed.' % child.before.rstrip('\r\n'))
+            sys.exit(8)
+        if i==0:
+            child.sendline("yes")
+            i = child.expect(exp_type)
+        if i==2: # password or passphrase
+            child.sendline(password)
+            i = child.expect(exp_type)
+        if i==4:
+            child.sendline('ansi')
+            i = child.expect(exp_type)
+        #Phase 2
+        if i==2: # password or passphrase
+            child.sendline(password)
+            i = child.expect(exp_type)
+
+        if self.opt.username != 'root' and self.opt.nosudo == False:
+            if i==1:
+                print '\n'.join(child.before.split('\n')[1:][:-1])
+                child.sendline(sudo_cmd)
+                child.expect(r"\[sudo\] password for")
+                child.sendline(password)
+                child.expect(exp_prompt) 
+                if self.opt.notmout == True:
+                    child.sendline(('export HOME=$(grep ^root: /etc/passwd | head -1 | cut -d: -f6);'
+                                    'export TERM=%s;'
+                                    'eval "$(sed -e "/^for.*profile\.d/,/^done/d" -e "/^if.*\/etc\/bashrc/,/^fi/d" /etc/profile /root/.bashrc)";'  
+                                    'for i in $(ls -1 /etc/profile.d/*.sh | grep -v autologout.sh);  do source $i; done;cat /etc/motd') % self.get_terminal());
+                    child.expect(r"\n")
+        else:
+                print '\n'.join(child.before.split('\n')[1:][:-1])
+
+
+        (width, height) = self.__getTerminalSize()
+        child.setwinsize(height, width)
+        child.interact()
+
+    def __sigwinch_passthrough (self, sig, data):
+        if 'TIOCGWINSZ' in dir(termios):
+            TIOCGWINSZ = termios.TIOCGWINSZ
+        else:
+            TIOCGWINSZ = 1074295912 # assume
+        s = struct.pack ("HHHH", 0, 0, 0, 0)
+        a = struct.unpack ('HHHH', fcntl.ioctl(sys.stdout.fileno(), TIOCGWINSZ , s))
+        self.pexpect_instance.setwinsize(a[0],a[1])
+
+    def __getTerminalSize(self):
+        def ioctl_GWINSZ(fd):
+            try:
+                cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ, '1234'))
+            except:
+                return None
+            return cr
+        cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+        if not cr:
+            try:
+                fd = os.open(os.ctermid(), os.O_RDONLY)
+                cr = ioctl_GWINSZ(fd)
+                os.close(fd)
+            except:
+                pass
+        if not cr:
+            try:
+                cr = (env['LINES'], env['COLUMNS'])
+            except:
+                cr = (25, 80)
+        return int(cr[1]), int(cr[0])
+
+class JMPresolv(object):
+    """ Resolver class to expand short hostnames """
+    def __init__(self, resolv_conf='/etc/resolv.conf'):
+        self.resolv_conf = resolv_conf
+        self.__parse()
+
+    def __parse(self):
+        "Parse the resolv.conf file and extract search domains"
+        lines=open(self.resolv_conf).readlines()
+        self.domains = []
+        for line in lines:
+            line = string.strip(line)
+            if not line or line[0]==';' or line[0]=='#':
+                continue
+            fields=string.split(line)
+            if len(fields) < 2:
+                continue
+            if fields[0]=='domain' and len(fields) > 1:
+                self.domains.insert(0,fields[1])
+            if fields[0]=='search':
+                for d in fields[1:]:
+                    self.domains.append(d)
+            if fields[0]=='options':
+                pass
+            if fields[0]=='sortlist':
+                pass
+            if fields[0]=='nameserver':
+                pass
+
+    def getfqdn(self, host):
+        ip, fqdn = None, None
+        for i in self.domains:
+            fqdn = '.'.join([host, i]) 
+            try:
+                ip = socket.gethostbyname(fqdn)
+            except Exception:
+                pass
+            if ip: 
+                return fqdn
+    @staticmethod
+    def validIP(string):
+        try:
+            socket.inet_aton(string)
+            return True
+        except socket.error:
+            pass
+    
+        
+if __name__ == "__main__":
+    jmp = JMPCore()
+    passwd = jmp.get_pass()
+    jmp.sshlogin(passwd)
+
+
